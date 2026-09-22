@@ -1,0 +1,17 @@
+# virtual environments
+.venv/
+venv/
+
+# training outputs
+vqc-rl/runs/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

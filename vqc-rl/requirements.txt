@@ -1,0 +1,5 @@
+numpy>=2.0
+matplotlib>=3.8
+torch>=2.2
+pennylane>=0.40
+pillow>=10.0
