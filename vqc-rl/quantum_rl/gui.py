@@ -1078,7 +1078,7 @@ class App(tk.Tk):
         a.tick_params(colors=MUTED, labelsize=11, length=4, width=0.9)
         a.grid(True, color=BORDER, alpha=0.75, linewidth=0.6)
         a.set_axisbelow(True)
-        a.set_title(title, color=TEXT, fontsize=14, pad=12, loc="left", fontweight="semibold")
+        a.set_title(title, color=TEXT, fontsize=14, pad=12, loc="left", fontweight="bold")
         if xlabel:
             a.set_xlabel(xlabel, color=FAINT, fontsize=11)
         if ylabel:
@@ -2351,8 +2351,8 @@ class App(tk.Tk):
 
                 if kind == "game":
                     game = payload["game"]
-                    if payload.get("transient_boundary") and game >= 0:
-                        self._lr_transition_game = game
+                    if payload.get("transient_boundary") and payload["game"] >= 0:
+                        self._lr_transition_game = payload["game"]
                     self.params.append(game, payload["weights"],
                                        payload["grad_rms"])
                     g = payload["grad_rms"]
@@ -2414,8 +2414,8 @@ class App(tk.Tk):
                         self.policy = payload["policy"]
                     if payload.get("transition_game") is not None:
                         self._lr_transition_game = payload["transition_game"]
-                    elif payload.get("transient_boundary") and game >= 0:
-                        self._lr_transition_game = game
+                    elif payload.get("transient_boundary") and payload["game"] >= 0:
+                        self._lr_transition_game = payload["game"]
                     self.chip_vals["game"].set("%d / %d" % (payload["game"],
                                                             self.total_games))
                     self._update_metric_chips()
