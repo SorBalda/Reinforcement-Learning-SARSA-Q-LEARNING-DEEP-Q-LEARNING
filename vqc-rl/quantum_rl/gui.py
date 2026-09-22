@@ -134,12 +134,18 @@ GROUPS = [
          "this: it fixes the representable range of the Q-values."),
     ]),
     ("Learning", [
-        ("LR_0", "Initial learning rate", float,
-         "RMSprop step size. The notebook uses 0.2, which is too high and makes "
-         "the optimiser bounce past the minimum: 0.01 is a saner starting point."),
+        ("LR_0", "Transient learning rate", float,
+         "RMSprop step size during the initial transient. It may be deliberately "
+         "high to move quickly before the stationary schedule begins."),
+        ("lr_transient_steps", "Transient duration (optimizer steps)", int,
+         "Number of RMSprop optimizer steps for which the transient learning rate "
+         "is held fixed. The core reports the corresponding episode boundary."),
+        ("LR_AFTER_TRANSIENT", "Post-transient learning rate", float,
+         "Learning rate immediately after the transient. This is also the starting "
+         "value for the subsequent halving schedule."),
         ("lr_scheduler_step_size", "Halve the lr every N episodes", int,
-         "The notebook uses 3, which kills the learning rate by episode 24. "
-         "A quarter of the total episodes is a reasonable choice."),
+         "Number of episodes between multiplicative halvings after the transient. "
+         "The value is never reduced below LR min."),
         ("LR_MIN", "Minimum learning rate", float,
          "Below this threshold the scheduler stops reducing the lr."),
         ("len_batch", "Minibatch size", int,
@@ -153,6 +159,14 @@ GROUPS = [
          "Exploration rate at the start of training."),
         ("epsilon_min", "Final epsilon", float,
          "Exploration rate at the end of training."),
+        ("epsilon_decay_mode", "Epsilon decay", ("choice", ("linear", "exponential", "cosine", "constant")),
+         "Schedule used to move epsilon from its initial to its final value."),
+        ("epsilon_decay_duration", "Decay duration (episodes)", int,
+         "Number of episodes over which epsilon moves from epsilon_0 to epsilon_min. "
+         "At this duration it reaches epsilon_min exactly."),
+        ("epsilon_decay_interval", "Update every N episodes", int,
+         "Epsilon is updated only at this episode interval. Larger values make the "
+         "schedule a staircase while preserving its configured duration."),
     ]),
     ("Execution", [
         ("seed", "Random seed", int,
@@ -167,7 +181,11 @@ DEFAULT_OVERRIDES = {
     "num_games": 1000,
     "max_time": 40,
     "LR_0": 0.01,
+    "lr_transient_steps": 100,
+    "LR_AFTER_TRANSIENT": 0.005,
     "lr_scheduler_step_size": 250,
+    "epsilon_decay_duration": 1800,
+    "epsilon_decay_interval": 1,
     "seed": 1,
 }
 
@@ -240,7 +258,9 @@ class App(tk.Tk):
         self.policy = None        # current argmax_a Q(s,a), from the monitor
         self.policy_ref = None    # Bellman's optimal policy
         self.correct = None
-        self.view = "curve"       # "curve" | "policy"
+        self.view = "curve"       # overview views: curve, policy, circuit, grads, focus
+        self.focus_metric = 0       # MSE, loss, reward, utilities, schedule
+        self._lr_transition_game = None
         self._run_reward = None   # living reward of the current run
         self.last_episode = None
         self.episode_view = None
@@ -311,24 +331,26 @@ class App(tk.Tk):
         probe = tkfont.Font(family=fam, size=-20)
         per_px = (probe.metrics("linespace") or 28) / 20.0
         ref = tkfont.nametofont("TkDefaultFont").metrics("linespace") or 22
-        unit = max(12, min(21, int(round(ref / max(per_px, 0.8)))))
+        # Slightly generous baseline: scientific labels and live values must be
+        # readable on laptop/high-DPI displays without requiring zooming.
+        unit = max(14, min(24, int(round(ref / max(per_px, 0.8)))))
 
         def px(k):
             return -max(9, int(round(unit * k)))
 
         FONTS.update({
-            "title": (fam, px(1.75), "bold"),
-            "sub": (fam, px(0.78)),
-            "card": (fam, px(0.78), "bold"),
-            "body": (fam, px(0.86)),
-            "small": (fam, px(0.80)),
-            "tip": (fam, px(0.80)),
-            "tip_b": (fam, px(0.80), "bold"),
-            "btn": (fam, px(0.92), "bold"),
-            "btn_s": (fam, px(0.80), "bold"),
-            "mono": (mono, px(0.82)),
-            "mono_b": (mono, px(0.98), "bold"),
-            "chip": (fam, px(0.70), "bold"),
+            "title": (fam, px(1.85), "bold"),
+            "sub": (fam, px(0.86)),
+            "card": (fam, px(0.88), "bold"),
+            "body": (fam, px(0.96)),
+            "small": (fam, px(0.88)),
+            "tip": (fam, px(0.88)),
+            "tip_b": (fam, px(0.88), "bold"),
+            "btn": (fam, px(1.02), "bold"),
+            "btn_s": (fam, px(0.90), "bold"),
+            "mono": (mono, px(0.92)),
+            "mono_b": (mono, px(1.08), "bold"),
+            "chip": (fam, px(0.80), "bold"),
         })
 
     def _init_style(self):
@@ -603,18 +625,32 @@ class App(tk.Tk):
                        justify="left", font=FONTS["body"], wraplength=900)
         lbl.grid(row=0, column=0, sticky="w")
 
-        default = DEFAULT_OVERRIDES.get(name, getattr(defaults, name, ""))
+        fallback = {"epsilon_decay_mode": "linear",
+                    "epsilon_decay_duration": 1800,
+                    "epsilon_decay_interval": 1,
+                    "lr_transient_steps": 100,
+                    "LR_AFTER_TRANSIENT": 0.005}.get(name, "")
+        default = DEFAULT_OVERRIDES.get(name, getattr(defaults, name, fallback))
         var = tk.StringVar(value="" if default is None else str(default))
-        self.vars[name] = (var, kind)
+        # Choices remain strings in self.vars, so the normal setup persistence
+        # path applies without a special case.
+        is_choice = isinstance(kind, tuple) and kind[:1] == ("choice",)
+        converter = str if is_choice else kind
+        self.vars[name] = (var, converter)
 
         cage = tk.Frame(line, bg=BORDER)
         cage.grid(row=0, column=1, sticky="e", padx=(12, 0))
-        entry = tk.Entry(cage, textvariable=var, width=9, justify="right",
-                         bg=FIELD, fg=TEXT, insertbackground=accent,
-                         relief="flat", bd=0, font=FONTS["mono"],
-                         disabledbackground=FIELD, highlightthickness=0,
-                         selectbackground=_mix(FIELD, accent, 0.45),
-                         selectforeground=TEXT)
+        if is_choice:
+            entry = ttk.Combobox(cage, textvariable=var,
+                                 values=kind[1], state="readonly", width=15,
+                                 font=FONTS["mono"])
+        else:
+            entry = tk.Entry(cage, textvariable=var, width=9, justify="right",
+                             bg=FIELD, fg=TEXT, insertbackground=accent,
+                             relief="flat", bd=0, font=FONTS["mono"],
+                             disabledbackground=FIELD, highlightthickness=0,
+                             selectbackground=_mix(FIELD, accent, 0.45),
+                             selectforeground=TEXT)
         entry.pack(padx=1, pady=1, ipady=4, ipadx=6)
         entry.bind("<FocusIn>", lambda _e, c=cage, a=accent: c.configure(bg=a))
         entry.bind("<FocusOut>", lambda _e, c=cage: c.configure(bg=BORDER))
@@ -743,8 +779,9 @@ class App(tk.Tk):
         seg = tk.Frame(ctl, bg=_mix(BG, "#ffffff", .05), bd=0,
                        highlightthickness=1, highlightbackground=BORDER_HI)
         seg.pack(side="left")
-        for key, label in (("curve", "  Curves  "), ("policy", "  Policy  "),
-                           ("circuit", "  Circuit  "), ("grads", "  Gradients  ")):
+        for key, label in (("curve", "  Overview  "), ("focus", "  Focus  "),
+                           ("policy", "  Policy  "), ("circuit", "  Circuit  "),
+                           ("grads", "  Gradients  ")):
             b = tk.Label(seg, text=label, bg=_mix(BG, "#ffffff", .05), fg=MUTED,
                          font=FONTS["small"], padx=10, pady=5, cursor="hand2")
             b.pack(side="left")
@@ -793,6 +830,25 @@ class App(tk.Tk):
                 title="shared moving average")
         self._paint_avg_btns()
 
+        # Focus mode: one large, readable scientific panel.  A native Tk Scale
+        # is used as the QSlider-equivalent control so it remains dependency-free.
+        self._focus_box = tk.Frame(ctl, bg=BG)
+        tk.Label(self._focus_box, text="METRIC", bg=BG, fg=FAINT,
+                 font=FONTS["chip"]).pack(side="left", padx=(20, 8))
+        self.focus_name = tk.StringVar(value="MSE")
+        tk.Label(self._focus_box, textvariable=self.focus_name, bg=BG, fg=CYAN,
+                 font=FONTS["body"]).pack(side="left", padx=(0, 8))
+        self.focus_slider = tk.Scale(
+            self._focus_box, from_=0, to=4, orient="horizontal", showvalue=False,
+            resolution=1, length=220, width=18, sliderlength=24,
+            bg=BG, troughcolor=BORDER, activebackground=CYAN,
+            highlightthickness=0, bd=0, fg=TEXT,
+            command=self._focus_changed)
+        self.focus_slider.set(self.focus_metric)
+        self.focus_slider.pack(side="left", padx=(0, 8))
+        tk.Label(self._focus_box, text="← drag to inspect one curve →", bg=BG,
+                 fg=FAINT, font=FONTS["small"]).pack(side="left")
+
         # layer selector of the Gradients view: "All" plus one chip per layer,
         # rebuilt at every start (the depth is a setup parameter)
         self._layer_box = tk.Frame(ctl, bg=BG)
@@ -831,6 +887,14 @@ class App(tk.Tk):
         self._holder = holder
         self._tkw_curve = tkw
 
+        # Focus figure/canvas: rebuilt as one large axis whenever the slider
+        # changes, while the overview retains its five-panel live dashboard.
+        self.fig_focus = Figure(figsize=(14, 8), dpi=100, facecolor=BG)
+        self.ax_focus = self.fig_focus.add_subplot(1, 1, 1)
+        self.canvas_focus = FigureCanvasTkAgg(self.fig_focus, master=holder)
+        self._tkw_focus = self.canvas_focus.get_tk_widget()
+        self._tkw_focus.configure(bg=BG, highlightthickness=0, bd=0)
+
         # policy figure, in the same holder: only one of the two is shown
         self.fig_pol = Figure(figsize=(12, 7), dpi=100, facecolor=BG)
         self.ax_pol = [self.fig_pol.add_subplot(1, 2, i + 1) for i in range(2)]
@@ -866,14 +930,15 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- views ---
     def set_view(self, which: str):
-        """Show one view at a time: curves, policy, circuit or gradients."""
+        """Show one view at a time: overview, focus, policy, circuit or gradients."""
         self.view = which
         for key, btn in self._view_btns.items():
             on = (key == which)
             btn.configure(fg=CYAN if on else MUTED,
                           bg=_mix(BG, CYAN, .18) if on else _mix(BG, "#ffffff", .05))
-        widgets = {"curve": self._tkw_curve, "policy": self._tkw_pol,
-                   "circuit": self.circuit, "grads": self._grads_frame}
+        widgets = {"curve": self._tkw_curve, "focus": self._tkw_focus,
+                   "policy": self._tkw_pol, "circuit": self.circuit,
+                   "grads": self._grads_frame}
         for w in widgets.values():
             w.pack_forget()
         widgets[which].pack(fill="both", expand=True, padx=1, pady=1)
@@ -881,6 +946,10 @@ class App(tk.Tk):
             self._log_box.pack(side="left")
         else:
             self._log_box.pack_forget()
+        if which == "focus":
+            self._focus_box.pack(side="left")
+        else:
+            self._focus_box.pack_forget()
         if which == "grads":
             self._layer_box.pack(side="left")
         else:
@@ -889,6 +958,78 @@ class App(tk.Tk):
             self.update_idletasks()
             self.circuit.refresh(force=True)
         self._redraw()
+
+    _FOCUS_NAMES = ("MSE", "loss", "reward", "utilities", "schedule")
+
+    def _focus_changed(self, value):
+        self.focus_metric = max(0, min(4, int(float(value))))
+        self.focus_name.set(self._FOCUS_NAMES[self.focus_metric])
+        if self.view == "focus":
+            self._redraw_focus()
+
+    def _draw_transition_boundary(self, ax):
+        """Mark the configured transient boundary when it is known."""
+        game = self._lr_transition_game
+        if game is not None and game > 0:
+            ax.axvline(game, color=AMBER, lw=1.5, ls=":", alpha=.9,
+                       label="transient → post-transient")
+            ax.text(game, .98, "transient", transform=ax.get_xaxis_transform(),
+                    color=AMBER, fontsize=10, ha="right", va="top")
+
+    def _redraw_focus(self):
+        """Render exactly one large metric panel selected by the slider."""
+        if not hasattr(self, "ax_focus"):
+            return
+        a = self.ax_focus
+        a.clear()
+        h = self.history
+        n = self.loss_avg_n
+        idx = self.focus_metric
+        if idx == 0:
+            g, v, color, title = h["game"], h["mse"], CYAN, "MSE against Bellman"
+            self._apply_yscale(a, v, self.log_mse.get())
+        elif idx == 1:
+            g, v, color, title = self.loss_ep["game"], self.loss_ep["loss"], AMBER, "training loss"
+            self._apply_yscale(a, v, self.log_loss.get())
+        elif idx == 2:
+            g, v, color, title = self.reward_ep["game"], self.reward_ep["reward"], GREEN, "discounted reward"
+        elif idx == 3:
+            g = self.correct or []
+            if self.U is not None and self.correct:
+                a.plot(g, [self.U_ref[i] for i in g], "o--", color=CYAN,
+                       lw=2.2, ms=8, label="Bellman (exact)")
+                a.plot(g, [self.U[i] for i in g], "*-", color=AMBER,
+                       lw=2.4, ms=14, label="VQC (learned)")
+                a.legend(fontsize=12, facecolor=_mix(BG, "#ffffff", .07),
+                         edgecolor=BORDER_HI, labelcolor=TEXT)
+            self._style_axes(a, "state utilities  ·  maxₐ Q(s,a)", "state", "utility")
+            self.fig_focus.subplots_adjust(left=.08, right=.97, bottom=.10, top=.93)
+            self.canvas_focus.draw_idle()
+            return
+        else:
+            g, v, color, title = h["game"], h["lr"], GREEN, "learning-rate and exploration schedule"
+            a.plot(g, v, color=color, lw=2.4, label="learning rate")
+            if h["eps"]:
+                a.plot(h["game"], h["eps"], color=VIOLET, lw=2.2, ls="--", label="epsilon")
+            self._draw_transition_boundary(a)
+            a.legend(fontsize=12, facecolor=_mix(BG, "#ffffff", .07),
+                     edgecolor=BORDER_HI, labelcolor=TEXT)
+            self._style_axes(a, title, "episodes")
+            self.fig_focus.subplots_adjust(left=.08, right=.97, bottom=.10, top=.93)
+            self.canvas_focus.draw_idle()
+            return
+        if g:
+            a.plot(g, v, color=color, lw=1.0, alpha=.24)
+            if n > 1:
+                a.plot(g, self._moving_avg(g, v, n), color=color, lw=2.8,
+                       label="moving average (%d episodes)" % n)
+            else:
+                a.plot(g, v, color=color, lw=2.2, label="per episode")
+            a.legend(fontsize=12, facecolor=_mix(BG, "#ffffff", .07),
+                     edgecolor=BORDER_HI, labelcolor=TEXT)
+        self._style_axes(a, title, "episodes")
+        self.fig_focus.subplots_adjust(left=.08, right=.97, bottom=.10, top=.93)
+        self.canvas_focus.draw_idle()
 
     def open_episode_replay(self):
         """Open (or refresh) an animated replay of the latest completed episode."""
@@ -934,14 +1075,14 @@ class App(tk.Tk):
             sp.set_linewidth(0.8)
             if side in ("top", "right"):
                 sp.set_visible(False)
-        a.tick_params(colors=MUTED, labelsize=9.5, length=3, width=0.8)
+        a.tick_params(colors=MUTED, labelsize=11, length=4, width=0.9)
         a.grid(True, color=BORDER, alpha=0.75, linewidth=0.6)
         a.set_axisbelow(True)
-        a.set_title(title, color=TEXT, fontsize=12.5, pad=10, loc="left")
+        a.set_title(title, color=TEXT, fontsize=14, pad=12, loc="left", fontweight="semibold")
         if xlabel:
-            a.set_xlabel(xlabel, color=FAINT, fontsize=10)
+            a.set_xlabel(xlabel, color=FAINT, fontsize=11)
         if ylabel:
-            a.set_ylabel(ylabel, color=FAINT, fontsize=10)
+            a.set_ylabel(ylabel, color=FAINT, fontsize=11)
 
     @staticmethod
     def _tick_text(v, _pos=None):
@@ -1068,6 +1209,8 @@ class App(tk.Tk):
             self._redraw_grads()
         elif view == "curve":
             self._redraw_curves()
+        elif view == "focus":
+            self._redraw_focus()
 
     # ---------------------------------------------------------- gradients ---
     #: red (vanishing) -> amber -> green (healthy), same scale as the circuit
@@ -1713,8 +1856,9 @@ class App(tk.Tk):
         self._style_axes(a, "utilities  max$_a$ Q(s,a)", "state")
 
         a = self.ax[4]
-        a.plot(h["game"], h["lr"], color=GREEN, lw=1.7)
+        a.plot(h["game"], h["lr"], color=GREEN, lw=2.0, label="learning rate")
         self._style_axes(a, "learning rate and epsilon", "episodes")
+        self._draw_transition_boundary(a)
         a.set_ylabel("learning rate", color=GREEN, fontsize=10)
         a.tick_params(axis="y", colors=GREEN)
         if h["lr"] and min(h["lr"]) > 0:
@@ -1730,6 +1874,11 @@ class App(tk.Tk):
         t.set_facecolor("none")
         for sp in t.spines.values():
             sp.set_visible(False)
+        if self._lr_transition_game is not None:
+            leg = a.legend(fontsize=9.5, facecolor=_mix(BG, "#ffffff", .07),
+                           edgecolor=BORDER_HI, labelcolor=TEXT,
+                           loc="upper right")
+            leg.get_frame().set_linewidth(.8)
 
         self.fig.subplots_adjust(left=.065, right=.93, bottom=.08, top=.94,
                                  hspace=.38, wspace=.35)
@@ -1777,7 +1926,12 @@ class App(tk.Tk):
             except ValueError:
                 raise ValueError(f"'{raw}' is not a valid value for {name}")
 
-        return replace(Config(fixes=self._fixes()), **kw)
+        # Keep the GUI usable with older Config objects during upgrades; new
+        # controls are accepted automatically as soon as the core exposes them.
+        from dataclasses import fields
+        known = {f.name for f in fields(Config)}
+        return replace(Config(fixes=self._fixes()),
+                       **{k: v for k, v in kw.items() if k in known})
 
     def _extra_setup_state(self):
         """Subclass hook for setup controls not stored in ``self.vars``."""
@@ -1886,10 +2040,21 @@ class App(tk.Tk):
         self.stop_flag.clear()
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
+        # The transient is measured in optimiser steps, not episodes. Keep the
+        # boundary unset until the core monitor reports the actual episode in
+        # which it occurs; this avoids drawing a misleading converted x-value.
+        self._lr_transition_game = None
+        eps_duration = getattr(cfg, "epsilon_decay_duration",
+                               getattr(cfg, "epsilon_decay_denom", "—"))
+        eps_interval = getattr(cfg, "epsilon_decay_interval", 1)
         self.run_label.config(
-            text="%d episodes · %d layer · lr %g · γ %g   →  %s"
-                 % (cfg.num_games, cfg.deep_layers, cfg.LR_0, cfg.gamma,
-                    out_dir))
+            text=("%d ep · %d layers · transient lr %g → %g for %d optimizer steps · "
+                  "ε %s / %s ep (every %s)   →  %s")
+                 % (cfg.num_games, cfg.deep_layers, cfg.LR_0,
+                    getattr(cfg, "LR_AFTER_TRANSIENT", cfg.LR_0),
+                    getattr(cfg, "lr_transient_steps", 0),
+                    cfg.epsilon_decay_mode, eps_duration, eps_interval,
+                    os.path.basename(os.path.normpath(out_dir))))
         self.status.set("building the environment and the Bellman reference...")
         self.show_training()
         self._draw_progress()
@@ -2058,8 +2223,8 @@ class App(tk.Tk):
             if self.view == "circuit":
                 path = self._save_circuit(path)
             else:
-                fig = {"policy": self.fig_pol, "grads": self.fig_grad}.get(
-                    self.view, self.fig)
+                fig = {"policy": self.fig_pol, "grads": self.fig_grad,
+                       "focus": self.fig_focus}.get(self.view, self.fig)
                 fig.savefig(path, dpi=150, facecolor=fig.get_facecolor())
             self.status.set(f"saved to {path}")
         except Exception as e:  # noqa: BLE001 - reported, never fatal
@@ -2186,6 +2351,8 @@ class App(tk.Tk):
 
                 if kind == "game":
                     game = payload["game"]
+                    if payload.get("transient_boundary") and game >= 0:
+                        self._lr_transition_game = game
                     self.params.append(game, payload["weights"],
                                        payload["grad_rms"])
                     g = payload["grad_rms"]
@@ -2245,6 +2412,10 @@ class App(tk.Tk):
                         self.U_ref = payload["U_ref"]
                     if payload.get("policy") is not None:
                         self.policy = payload["policy"]
+                    if payload.get("transition_game") is not None:
+                        self._lr_transition_game = payload["transition_game"]
+                    elif payload.get("transient_boundary") and game >= 0:
+                        self._lr_transition_game = game
                     self.chip_vals["game"].set("%d / %d" % (payload["game"],
                                                             self.total_games))
                     self._update_metric_chips()

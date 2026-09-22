@@ -131,7 +131,22 @@ class Config:
     # restores the 3.
     lr_scheduler_step_size: int = 5000
     lr_scheduler_gamma: float = 0.5
-    epsilon_decay_denom: float = 2000.0  # eps = max(eps_0 - (m+1)/2000, eps_min)
+    epsilon_decay_mode: str = "linear"
+    epsilon_decay_denom: float = 2000.0  # legacy scale: eps = max(eps_0 - (m+1)/denom, eps_min)
+    # Optional explicit duration for the decay. ``None`` preserves the
+    # notebook/API denominator semantics above; when set, the selected decay
+    # reaches epsilon_min exactly after this many episodes.
+    epsilon_decay_duration: int | None = None
+    # Hold epsilon_0 for this many episodes between decay updates. 1 is the
+    # legacy behaviour (one update after every completed episode).
+    epsilon_decay_interval: int = 1
+
+    # Optional two-phase learning-rate schedule. With the defaults (None/0)
+    # the original per-episode StepLR schedule is unchanged. When both are
+    # configured, LR_0 is used for exactly ``lr_transient_steps`` optimiser
+    # steps, then LR_AFTER_TRANSIENT becomes the StepLR starting value.
+    LR_AFTER_TRANSIENT: float | None = None
+    lr_transient_steps: int = 0
     eval_every: int = 20  # cell 50, ``if m % 20 == 0 and m > 0``
     weight_init_scale: float = 0.3  # cell 50, 0.3 * np.random.randn(...)
 

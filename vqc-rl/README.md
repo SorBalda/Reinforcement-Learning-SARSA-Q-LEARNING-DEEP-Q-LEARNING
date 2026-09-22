@@ -4,7 +4,9 @@ This repository studies a variational quantum circuit (VQC) as the function
 approximator in deep Q-learning. The experiment couples a stochastic 4×3 grid
 world, an exact Bellman reference, and a four-qubit PennyLane/PyTorch model.
 The GUI exposes the circuit, parameter trajectories, gradients, policy, live
-state utilities, and episode-level rewards in the same run directory.
+state utilities, and episode-level rewards in the same run directory. Its
+Overview keeps all five live panels visible; Focus enlarges one metric and a
+slider selects MSE, loss, reward, utilities, or the learning schedule.
 
 ## Method
 
@@ -20,8 +22,12 @@ y=r+\gamma(1-d)\max_{a'}Q_{\theta^-}(s',a'),
 \mathcal L(\theta)=\tfrac12\bigl(Q_\theta(s,a)-y\bigr)^2.
 \]
 The target network, epsilon-greedy interaction, stochastic slip model, and
-Bellman value iteration are configurable. `Config.notebook()` reproduces the
-legacy experiment; the default flags enable the corrected dynamics.
+Bellman value iteration are configurable. Epsilon can decay linearly,
+exponentially, with a cosine schedule, or remain constant; the GUI exposes its
+duration and update interval. Learning-rate control has an explicit transient
+(`LR_0`, number of optimizer steps), a post-transient value, halving interval,
+and minimum. `Config.notebook()` reproduces the legacy experiment; the default
+flags enable the corrected dynamics.
 
 ## Figures from a completed run
 
@@ -60,8 +66,7 @@ policies, curves, circuit views, `params_history.npz`, and
 
 Use a fixed seed and retain `summary.json` together with the run directory.
 The diagnostic analyses and interpretation of the failure mode are in
-[`diagnostics/README.md`](diagnostics/README.md). The test command currently
-passes 56 tests in the prepared environment:
+[`diagnostics/README.md`](diagnostics/README.md). The complete test suite can be run with:
 
 ```bash
 .venv/bin/pip install pytest

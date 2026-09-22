@@ -73,7 +73,14 @@ from .circuit import (DTYPE, decimal_to_binary_fix_length, default_qnode,
 from .config import Config, apply_seed
 from .environment import GridWorld
 
-__all__ = ["TrainResult", "train", "GOOD_PROBE_STATE", "BAD_PROBE_STATE"]
+__all__ = [
+    "TrainResult",
+    "train",
+    "epsilon_for_episode",
+    "lr_for_optimizer_step",
+    "GOOD_PROBE_STATE",
+    "BAD_PROBE_STATE",
+]
 
 
 # notebook cell 50: the two hardcoded probe states of the periodic report.
@@ -83,6 +90,92 @@ GOOD_PROBE_STATE = 10
 BAD_PROBE_STATE = 3
 _GOOD_PROBE_ACTION = 1
 _BAD_PROBE_ACTION = 0
+
+def epsilon_for_episode(cfg: Config, m: int) -> float:
+    """Return epsilon after episode ``m`` according to ``cfg``.
+
+    ``epsilon_decay_interval`` is an episode *update* interval: for ``K > 1``
+    epsilon remains at ``epsilon_0`` until episode ``K`` has completed, then
+    is evaluated at ``floor((m + 1) / K) * K``. The default ``K=1`` keeps the
+    original formula exactly. ``epsilon_decay_duration`` is an explicit
+    alternative to the legacy denominator and makes all non-constant
+    schedules reach ``epsilon_min`` at episode ``duration``.
+    """
+    mode = str(cfg.epsilon_decay_mode).lower()
+    if cfg.epsilon_decay_denom <= 0:
+        raise ValueError("epsilon_decay_denom must be > 0 (got %r)" % cfg.epsilon_decay_denom)
+    interval = cfg.epsilon_decay_interval
+    if isinstance(interval, bool) or int(interval) != interval or interval <= 0:
+        raise ValueError("epsilon_decay_interval must be an integer > 0 (got %r)" % interval)
+    duration = cfg.epsilon_decay_duration
+    if duration is not None and (
+        isinstance(duration, bool) or int(duration) != duration or duration <= 0
+    ):
+        raise ValueError("epsilon_decay_duration must be an integer > 0 or None (got %r)" % duration)
+    if mode not in {"linear", "exponential", "cosine", "constant"}:
+        raise ValueError("epsilon_decay_mode must be one of linear, exponential, cosine, or constant (got %r)" % cfg.epsilon_decay_mode)
+    if mode == "constant":
+        return float(cfg.epsilon_0)
+
+    # Keep this path spelled as the pre-interval implementation for exact
+    # default parity. In particular, the old linear schedule used
+    # ``float(m + 1)`` while cosine/exponential used ``float(m) + 1.0``.
+    if duration is None:
+        if interval == 1:
+            progress = min(max((float(m) + 1.0) / cfg.epsilon_decay_denom, 0.0), 1.0)
+            decay_count = float(m + 1)
+        else:
+            decay_count = float(((int(m) + 1) // int(interval)) * int(interval))
+            progress = min(max(decay_count / cfg.epsilon_decay_denom, 0.0), 1.0)
+    else:
+        elapsed = int(m) + 1
+        # A duration need not be a multiple of interval: once its endpoint is
+        # reached, force it even if the last update is a partial interval.
+        if elapsed >= int(duration):
+            decay_count = float(duration)
+        else:
+            decay_count = float((elapsed // int(interval)) * int(interval))
+        progress = min(max(decay_count / float(duration), 0.0), 1.0)
+    if mode == "linear":
+        if duration is not None:
+            # An explicit duration parameterises the full epsilon range, so
+            # the endpoint is epsilon_min even when epsilon_0-epsilon_min
+            # is not one (the historical denominator did not have this
+            # interpretation).
+            value = cfg.epsilon_0 + (cfg.epsilon_min - cfg.epsilon_0) * progress
+            return float(np.max([value, cfg.epsilon_min]))
+        if interval == 1:
+            return float(np.max([cfg.epsilon_0 - (float(m + 1) / cfg.epsilon_decay_denom), cfg.epsilon_min]))
+        return float(np.max([cfg.epsilon_0 - (decay_count / cfg.epsilon_decay_denom), cfg.epsilon_min]))
+    if mode == "cosine":
+        weight = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return float(cfg.epsilon_min + (cfg.epsilon_0 - cfg.epsilon_min) * weight)
+    if cfg.epsilon_0 <= 0 or cfg.epsilon_min <= 0:
+        raise ValueError("exponential epsilon decay requires epsilon_0 and epsilon_min > 0")
+    return float(cfg.epsilon_0 * (cfg.epsilon_min / cfg.epsilon_0) ** progress)
+
+
+def lr_for_optimizer_step(cfg: Config, optimizer_step: int) -> float:
+    """Return the transient-phase LR for a one-based optimizer step.
+
+    Steps ``1..lr_transient_steps`` use ``LR_0`` and step ``N+1`` uses
+    ``LR_AFTER_TRANSIENT``. If the two-phase schedule is not configured this
+    returns ``LR_0`` for all steps, preserving the existing scheduler path.
+    """
+    if optimizer_step < 1:
+        raise ValueError("optimizer_step must be >= 1 (got %r)" % optimizer_step)
+    if (
+        cfg.lr_transient_steps > 0
+        and (isinstance(cfg.lr_transient_steps, bool)
+             or int(cfg.lr_transient_steps) != cfg.lr_transient_steps)
+    ):
+        raise ValueError("lr_transient_steps must be an integer (got %r)" % cfg.lr_transient_steps)
+    if cfg.LR_AFTER_TRANSIENT is None or cfg.lr_transient_steps <= 0:
+        return float(cfg.LR_0)
+    if optimizer_step <= cfg.lr_transient_steps:
+        return float(cfg.LR_0)
+    return float(cfg.LR_AFTER_TRANSIENT)
+
 
 
 @dataclass
@@ -231,6 +324,21 @@ def train(
     if cfg.max_time < 1:
         # the notebook would raise ZeroDivisionError on `loss_game/cntr`
         raise ValueError(f"cfg.max_time must be >= 1 (got {cfg.max_time})")
+    # Validate schedules before constructing devices or starting training.
+    epsilon_for_episode(cfg, 0)
+    if (
+        isinstance(cfg.lr_transient_steps, bool)
+        or int(cfg.lr_transient_steps) != cfg.lr_transient_steps
+        or cfg.lr_transient_steps < 0
+    ):
+        raise ValueError(
+            "lr_transient_steps must be an integer >= 0 (got %r)"
+            % cfg.lr_transient_steps
+        )
+    if cfg.LR_AFTER_TRANSIENT is not None and cfg.LR_AFTER_TRANSIENT <= 0:
+        raise ValueError(
+            "LR_AFTER_TRANSIENT must be > 0 (got %r)" % cfg.LR_AFTER_TRANSIENT
+        )
     if cfg.len_batch < 1:
         # the notebook would raise AttributeError on `loss.backward()` (loss stays float)
         raise ValueError(f"cfg.len_batch must be >= 1 (got {cfg.len_batch})")
@@ -303,6 +411,13 @@ def train(
     scheduler = torch.optim.lr_scheduler.StepLR(
         opt, step_size=cfg.lr_scheduler_step_size, gamma=cfg.lr_scheduler_gamma
     )
+    # The default path below intentionally remains the notebook's exact
+    # per-episode StepLR sequence.  The optional path delays scheduler ticks
+    # until the transient has completed and starts from LR_AFTER_TRANSIENT.
+    transient_enabled = (
+        cfg.LR_AFTER_TRANSIENT is not None and cfg.lr_transient_steps > 0
+    )
+    transient_complete = not transient_enabled
     mse_min = 1000.0  # notebook: MAE_min
     best_weights = None
     total_steps = 0
@@ -311,7 +426,10 @@ def train(
     if game_monitor is not None:
         game_monitor({"game": -1,
                       "weights": var_Q_circuit.detach().numpy().copy(),
-                      "grad_rms": None, "steps": 0})
+                      "grad_rms": None, "steps": 0,
+                      "lr": float(opt.param_groups[0]["lr"]),
+                      "lr_phase": "transient" if transient_enabled else "scheduled",
+                      "transient_boundary": False})
 
     # ---- the game loop -----------------------------------------------------
     for m in range(cfg.num_games):
@@ -325,6 +443,9 @@ def train(
         game_reward = 0.0
         cntr = 0
         loss_game = 0.0
+        # True only for the episode containing the N-th transient step.  That
+        # episode is deliberately not counted by StepLR.
+        transient_boundary_this_game = False
 
         for _time in range(cfg.max_time):
             a = epsilon_greedy(
@@ -370,6 +491,14 @@ def train(
 
                 loss = loss + loss_fnc(pred, y) / cfg.len_batch
 
+            # Set the LR immediately before each optimiser step.  Thus the
+            # first N steps use LR_0 and the next step starts at the post-
+            # transient LR, with no off-by-one at an episode boundary.
+            if transient_enabled and not transient_complete:
+                step_lr = lr_for_optimizer_step(cfg, total_steps + 1)
+                if opt.param_groups[0]["lr"] != step_lr:
+                    opt.param_groups[0]["lr"] = step_lr
+
             opt.zero_grad()
             loss.backward()
             if grad_sq is not None and var_Q_circuit.grad is not None:
@@ -381,6 +510,12 @@ def train(
             cntr += 1
             c += 1
             total_steps += 1
+            if transient_enabled and not transient_complete and total_steps >= cfg.lr_transient_steps:
+                # Switch right after step N, so a possible step N+1 uses the
+                # post-transient value even when N ends an episode.
+                opt.param_groups[0]["lr"] = float(cfg.LR_AFTER_TRANSIENT)
+                transient_complete = True
+                transient_boundary_this_game = True
             if c >= cfg.C:
                 var_target_Q_circuit = var_Q_circuit.clone().detach()
                 c = 0
@@ -393,16 +528,22 @@ def train(
             game_reward += reward_history[esponent] * gamma**esponent
         games_reward.append(game_reward)
         loss_games.append(loss_game / cntr)
-        epsilon = float(
-            np.max([cfg.epsilon_0 - (float(m + 1) / cfg.epsilon_decay_denom), cfg.epsilon_min])
-        )
+        epsilon = epsilon_for_episode(cfg, m)
         if progress:
             print(cntr)
 
         # notebook: step the scheduler only while the LR is still above the
         # floor -- so the LR settles just ABOVE LR_MIN and is never clamped to it.
-        if opt.param_groups[0]["lr"] > cfg.LR_MIN:
-            scheduler.step()
+        # In two-phase mode the boundary episode is not a scheduler episode.
+        if (not transient_enabled or (transient_complete and not transient_boundary_this_game)):
+            if opt.param_groups[0]["lr"] > cfg.LR_MIN:
+                scheduler.step()
+                if transient_enabled:
+                    # The configured two-phase schedule is user-facing: its
+                    # halving must approach, but never cross, LR_MIN. Keep the
+                    # legacy/default path untouched for notebook parity.
+                    for group in opt.param_groups:
+                        group["lr"] = max(float(group["lr"]), float(cfg.LR_MIN))
 
         if game_monitor is not None:
             game_monitor({"game": m,
@@ -413,7 +554,13 @@ def train(
                           "trajectory": episode_trajectory.copy(),
                           "actions": episode_actions.copy(),
                           "rewards": episode_rewards.copy(),
-                          "steps": int(total_steps)})
+                          "steps": int(total_steps),
+                          "lr": float(opt.param_groups[0]["lr"]),
+                          "lr_phase": (
+                              "transient" if transient_enabled and not transient_complete
+                              else ("post_transient" if transient_enabled else "scheduled")
+                          ),
+                          "transient_boundary": bool(transient_boundary_this_game)})
 
         # ---- periodic evaluation (cell 50, `if m % 20 == 0 and m > 0`) -----
         if m % cfg.eval_every == 0 and m > 0:
@@ -470,6 +617,11 @@ def train(
                     "loss": float(np.mean(window)),
                     "loss_cum": float(np.mean(loss_games)) if loss_games else float("nan"),
                     "lr": float(opt.param_groups[0]["lr"]),
+                    "lr_phase": (
+                        "transient" if transient_enabled and not transient_complete
+                        else ("post_transient" if transient_enabled else "scheduled")
+                    ),
+                    "transient_boundary": bool(transient_boundary_this_game),
                     "epsilon": float(epsilon),
                     "mse": float(mse_value),
                     "steps": int(total_steps),

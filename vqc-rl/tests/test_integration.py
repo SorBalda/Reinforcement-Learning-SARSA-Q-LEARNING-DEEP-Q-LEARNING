@@ -24,7 +24,7 @@ from quantum_rl.circuit import (DTYPE, decimal_to_binary_fix_length, make_qnode,
                                 variational_classifier)
 from quantum_rl.config import Config, FixFlags, apply_seed
 from quantum_rl.environment import GridWorld
-from quantum_rl.train import TrainResult, train
+from quantum_rl.train import TrainResult, epsilon_for_episode, lr_for_optimizer_step, train
 
 # --------------------------------------------------------------------------- #
 # ground truth
@@ -573,3 +573,82 @@ def test_dead_parameters_have_no_effect():
                                    - expvals(W, state_bits(s))).max()
                             for s in range(12))
                 assert (moved < 1e-12) == dead[l, i, j], (l, i, j, moved)
+
+# epsilon schedules
+@pytest.mark.parametrize("mode", ["linear", "exponential", "cosine"])
+def test_epsilon_decay_reaches_minimum_and_is_monotone(mode):
+    c = Config(epsilon_decay_mode=mode, epsilon_decay_denom=10.0)
+    values = [epsilon_for_episode(c, m) for m in range(12)]
+    assert values[-1] == pytest.approx(c.epsilon_min)
+    assert all(a >= b for a, b in zip(values, values[1:]))
+
+def test_epsilon_constant_and_default_linear_parity():
+    c = Config(epsilon_decay_denom=10.0)
+    assert epsilon_for_episode(c, 0) == float(np.max([c.epsilon_0 - 1.0 / c.epsilon_decay_denom, c.epsilon_min]))
+    constant = Config(epsilon_decay_mode="constant", epsilon_decay_denom=10.0)
+    assert [epsilon_for_episode(constant, m) for m in (0, 10, 100)] == [constant.epsilon_0] * 3
+
+@pytest.mark.parametrize("kwargs", [{"epsilon_decay_mode": "unknown"}, {"epsilon_decay_denom": 0}, {"epsilon_decay_denom": -1}])
+def test_epsilon_decay_configuration_is_validated(kwargs):
+    with pytest.raises(ValueError, match="epsilon_decay"):
+        epsilon_for_episode(Config(**kwargs), 0)
+
+
+@pytest.mark.parametrize("mode", ["linear", "exponential", "cosine"])
+def test_epsilon_interval_and_explicit_duration(mode):
+    stepped = Config(epsilon_decay_mode=mode, epsilon_decay_denom=10.0, epsilon_decay_interval=3)
+    values = [epsilon_for_episode(stepped, m) for m in range(7)]
+    assert values[:2] == [stepped.epsilon_0, stepped.epsilon_0]
+    assert values[2] == pytest.approx(values[3])
+
+    # Duration is an endpoint in episodes, even when it is not divisible by K.
+    duration = Config(epsilon_decay_mode=mode, epsilon_decay_duration=7, epsilon_decay_interval=3)
+    assert epsilon_for_episode(duration, 6) == pytest.approx(duration.epsilon_min)
+    assert epsilon_for_episode(duration, 7) == pytest.approx(duration.epsilon_min)
+
+def test_epsilon_interval_and_duration_are_validated():
+    with pytest.raises(ValueError, match="epsilon_decay"):
+        epsilon_for_episode(Config(epsilon_decay_interval=0), 0)
+    with pytest.raises(ValueError, match="epsilon_decay"):
+        epsilon_for_episode(Config(epsilon_decay_duration=0), 0)
+
+def test_transient_lr_plan_has_exact_step_boundary():
+    cfg = Config(LR_0=0.2, LR_AFTER_TRANSIENT=0.05, lr_transient_steps=3)
+    assert [lr_for_optimizer_step(cfg, step) for step in range(1, 7)] == [0.2, 0.2, 0.2, 0.05, 0.05, 0.05]
+
+def test_transient_lr_plan_defaults_to_initial_lr():
+    cfg = Config(LR_0=0.2, lr_transient_steps=12)
+    assert [lr_for_optimizer_step(cfg, step) for step in (1, 12, 13)] == [0.2, 0.2, 0.2]
+
+
+def test_transient_lr_does_not_reset_after_scheduler_halving(qnode):
+    c = tiny_cfg(
+        num_games=4, max_time=1, eval_every=1,
+        LR_0=0.2, LR_AFTER_TRANSIENT=0.05, lr_transient_steps=1,
+        lr_scheduler_step_size=1, lr_scheduler_gamma=0.5, LR_MIN=1e-8,
+    )
+    seen = []
+    train(c, GridWorld(c), qnode=qnode, monitor=lambda data: seen.append(data["lr"]))
+    # Game 0 is the boundary and is not reported by the periodic monitor.
+    # Every later episode halves the post-transient value; it must not jump
+    # back to LR_AFTER_TRANSIENT before the next optimiser step.
+    assert seen == pytest.approx([0.025, 0.0125, 0.00625])
+
+def test_transient_lr_configuration_is_validated():
+    c = tiny_cfg(lr_transient_steps=-1)
+    with pytest.raises(ValueError, match="lr_transient_steps"):
+        train(c, GridWorld(c))
+    c = tiny_cfg(LR_AFTER_TRANSIENT=0.0)
+    with pytest.raises(ValueError, match="LR_AFTER_TRANSIENT"):
+        train(c, GridWorld(c))
+
+
+def test_transient_lr_halving_clamps_at_lr_min(qnode):
+    c = tiny_cfg(
+        num_games=4, max_time=1, eval_every=1,
+        LR_0=0.2, LR_AFTER_TRANSIENT=0.05, lr_transient_steps=1,
+        lr_scheduler_step_size=1, lr_scheduler_gamma=0.5, LR_MIN=0.02,
+    )
+    seen = []
+    train(c, GridWorld(c), qnode=qnode, monitor=lambda data: seen.append(data["lr"]))
+    assert seen == pytest.approx([0.025, 0.02, 0.02])
