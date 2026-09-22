@@ -1,4 +1,4 @@
-# Variational quantum circuit for Q-learning on a stochastic grid world
+# Variational quantum circuit for Q-learning on Frozen Lake Environment
 
 Reinforcement learning on the stochastic 4×3 grid world of Russell & Norvig,
 *Artificial Intelligence: A Modern Approach* (chapter 17), with the Q-function
