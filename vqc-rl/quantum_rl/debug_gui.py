@@ -73,6 +73,18 @@ class DebugApp(App):
             lab.bind("<Enter>", hover, add="+")
             self._auto_wrap(lab, inner, pad=46)
 
+    def _extra_setup_state(self):
+        return {"debug": {"bug_flags": {
+            name: bool(var.get()) for name, var in self.bug_vars.items()}}}
+
+    def _apply_extra_setup_state(self, data):
+        flags = data.get("debug", {}).get("bug_flags", {})
+        if not isinstance(flags, dict):
+            return
+        for name, value in flags.items():
+            if name in self.bug_vars:
+                self.bug_vars[name].set(bool(value))
+
     def _fixes(self) -> FixFlags:
         return FixFlags(**{n: v.get() for n, v in self.bug_vars.items()})
 

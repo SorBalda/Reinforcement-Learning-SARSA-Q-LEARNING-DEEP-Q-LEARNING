@@ -46,6 +46,11 @@ def launch(module: str, script: str) -> int:
         print(f"Missing dependency: {missing}", file=sys.stderr)
         if "tkinter" in str(e):
             print("Install Tk with:  sudo apt install python3-tk", file=sys.stderr)
+        elif not os.path.exists(VENV):
+            print("No .venv found. Create it with:", file=sys.stderr)
+            print(f"  python3 -m venv {VENV_DIR}", file=sys.stderr)
+            print(f"  {VENV} -m pip install -r {os.path.join(HERE, 'requirements.txt')}",
+                  file=sys.stderr)
         else:
             print(f"Install with:  {VENV} -m pip install {missing}", file=sys.stderr)
         return 1

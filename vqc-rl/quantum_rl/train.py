@@ -214,7 +214,9 @@ def train(
             quantity to watch for vanishing gradients), loss (the game's mean
             loss, i.e. the new entry of ``loss_games``; absent for game -1),
             steps.  It only reads
-            ``.grad``, so the training is bit-for-bit unchanged.
+            ``.grad``, so the training is bit-for-bit unchanged.  Completed
+            games also include ``discounted_reward``, ``trajectory`` (the
+            initial state and every successor), ``actions`` and ``rewards``.
         U_ref: Bellman utilities to score the MSE against.  ``None`` runs
             :func:`quantum_rl.bellman.value_iteration` with ``cfg.gamma`` /
             ``cfg.max_epoch``, which is what the notebook's ``U_final`` is.
@@ -316,6 +318,10 @@ def train(
         grad_sq = np.zeros(var_Q_circuit.shape) if game_monitor is not None else None
         s_1 = env.random_state(rng)
         reward_history: List[float] = []
+        # Observational playback data; this introduces no RNG calls.
+        episode_trajectory: List[int] = [int(s_1)]
+        episode_actions: List[int] = []
+        episode_rewards: List[float] = []
         game_reward = 0.0
         cntr = 0
         loss_game = 0.0
@@ -332,6 +338,9 @@ def train(
             )
             s_2 = env.next_position(s_1, a, rng)
             reward = env.R[s_2]
+            episode_actions.append(int(a))
+            episode_trajectory.append(int(s_2))
+            episode_rewards.append(float(reward))
             memory.append([s_1, a, reward, s_2])  # append + `if len(D)>=N: D.pop(0)`
             s_1 = s_2
 
@@ -400,6 +409,10 @@ def train(
                           "weights": var_Q_circuit.detach().numpy().copy(),
                           "grad_rms": np.sqrt(grad_sq / max(cntr, 1)),
                           "loss": float(loss_games[-1]),
+                          "discounted_reward": float(game_reward),
+                          "trajectory": episode_trajectory.copy(),
+                          "actions": episode_actions.copy(),
+                          "rewards": episode_rewards.copy(),
                           "steps": int(total_steps)})
 
         # ---- periodic evaluation (cell 50, `if m % 20 == 0 and m > 0`) -----

@@ -6,6 +6,7 @@ venv/
 vqc-rl/runs/
 
 # python
+vqc-rl/.vqc_gui_last_setup.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

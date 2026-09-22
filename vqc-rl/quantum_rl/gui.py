@@ -9,11 +9,14 @@ at the same time:
 
 * **Setup** -- only the parameter form, full width, laid out as cards across
   three columns.  Every field carries a help text, both as a tooltip and in the
-  info bar at the bottom.  The ``Output`` card picks the folder the run is saved
-  to.  A large ``Start`` button launches the run.
+  info bar at the bottom. The validated setup (including output folder, plot
+  preferences and debug flags) is stored atomically and restored at the next
+  launch. The ``Output`` card picks the run folder and ``Start`` launches it.
 * **Training** -- only the plots, full window, with a compact status bar
-  (episode, MSE, loss, lr, epsilon, gradient RMS) and the ``Stop``,
-  ``Save plot`` and ``Back`` buttons.  A segmented control switches between
+  (episode, moving-average MSE/loss/reward, lr, epsilon, non-zero gradient
+  RMS, total parameters and zero-gradient parameters) and the ``Stop``,
+  ``Save plot``, ``Episode replay`` and ``Back`` buttons. Replay animates the
+  latest completed episode in the grid and refreshes as training continues.  A segmented control switches between
   four views: the curves, the current policy, the live variational circuit
   with its weights and gradients (:mod:`quantum_rl.circuit_view`), and the
   gradients against time -- whole circuit, per layer, every parameter and the
@@ -21,15 +24,19 @@ at the same time:
   Gradients view has a layer selector (chips, arrow keys or a click on the
   heatmap) that focuses all four plots on one layer, and a side list of every
   parameter whose gradient is below a threshold (default 1e-10), in the last
-  episode or over the whole run.
+  episode or over the whole run. Exact and structural zeros are counted but
+  explicitly excluded from gradient curves, RMS aggregates and heatmaps. The
+  Curves view overlays one episode-based moving average on raw MSE, loss and
+  discounted reward, and shows Bellman and learned VQC utilities live; sparse
+  MSE samples still use a window measured in episodes.
 
 Saving is automatic, into the folder chosen in the setup:
 
 * at start: ``bellman_policy.pdf``, ``bellman_convergence.pdf`` and a first
   ``summary.json`` (config + Bellman reference);
 * during training, at most every ``IO_EVERY`` seconds: ``live.png`` and
-  ``progress.json`` (the curves so far), so a crash or a closed window never
-  loses the whole run;
+  ``progress.json`` (curves plus latest episode) and ``last_episode.json``, so
+  a crash or a closed window never loses the whole run;
 * at the end: the same files as the CLI (``policy.pdf``,
   ``training_curves.pdf``, ``utility_comparison.pdf``, ``residuals.pdf``, the
   full ``summary.json``) plus ``params_history.npz`` (weights and gradient RMS
@@ -57,6 +64,7 @@ training thread never touches a widget -- it only communicates through a
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -70,6 +78,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
+from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
 
 from .__main__ import LivePlotter
@@ -80,6 +89,7 @@ from .circuit_view import (GRAD_HI, GRAD_LO, PARAM_COLORS, PARAM_NAMES,
                            GRAD_ZERO, CircuitView, ParamHistory, dead_mask)
 from .config import Config, FixFlags
 from .environment import GridWorld
+from .episode_view import EpisodeView
 from .outputs import (base_summary, jsonable, training_summary,
                       write_bellman_plots, write_json, write_training_plots)
 from .train import train
@@ -93,6 +103,7 @@ from .gui_widgets import (AMBER, BG, BORDER, BORDER_HI, CARD, CARD_HI, CYAN,
 #: current directory, so ``runs/...`` lands in the same place however the GUI
 #: was launched
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LAST_SETUP_PATH = os.path.join(PROJECT_ROOT, ".vqc_gui_last_setup.json")
 
 # --------------------------------------------------------------------------- #
 # parameter metadata: (attribute, label, type, help text)
@@ -231,11 +242,14 @@ class App(tk.Tk):
         self.correct = None
         self.view = "curve"       # "curve" | "policy"
         self._run_reward = None   # living reward of the current run
+        self.last_episode = None
+        self.episode_view = None
         self.log_mse = tk.BooleanVar(value=True)
         # the loss spans decades and is noisy episode to episode: log by default
         self.log_loss = tk.BooleanVar(value=True)
         # per-episode loss (from game_monitor), independent of eval_every
         self.loss_ep = {"game": [], "loss": []}
+        self.reward_ep = {"game": [], "reward": []}
         self.loss_avg_n = 20      # moving-average window, in episodes; 1 = off
         self._curves_drawn = 0.0
         self._loss_new = False
@@ -252,6 +266,7 @@ class App(tk.Tk):
 
         self.frame_setup = self._build_setup()
         self.frame_train = self._build_training()
+        self._load_last_setup()
         self.show_setup()
         self.after(100, self._drain)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -264,6 +279,8 @@ class App(tk.Tk):
         the stop flag and give it a moment to leave the monitor.
         """
         self.stop_flag.set()
+        if self.episode_view is not None and self.episode_view.winfo_exists():
+            self.episode_view.close()
         # the window goes away immediately; the threads still writing the run
         # (the worker on Stop, the final-plot exporter) get time to finish
         self.withdraw()
@@ -294,24 +311,24 @@ class App(tk.Tk):
         probe = tkfont.Font(family=fam, size=-20)
         per_px = (probe.metrics("linespace") or 28) / 20.0
         ref = tkfont.nametofont("TkDefaultFont").metrics("linespace") or 22
-        unit = max(11, min(20, int(round(ref / max(per_px, 0.8)))))
+        unit = max(12, min(21, int(round(ref / max(per_px, 0.8)))))
 
         def px(k):
             return -max(9, int(round(unit * k)))
 
         FONTS.update({
             "title": (fam, px(1.75), "bold"),
-            "sub": (fam, px(0.72)),
-            "card": (fam, px(0.72), "bold"),
+            "sub": (fam, px(0.78)),
+            "card": (fam, px(0.78), "bold"),
             "body": (fam, px(0.86)),
-            "small": (fam, px(0.74)),
-            "tip": (fam, px(0.74)),
-            "tip_b": (fam, px(0.74), "bold"),
+            "small": (fam, px(0.80)),
+            "tip": (fam, px(0.80)),
+            "tip_b": (fam, px(0.80), "bold"),
             "btn": (fam, px(0.92), "bold"),
             "btn_s": (fam, px(0.80), "bold"),
             "mono": (mono, px(0.82)),
             "mono_b": (mono, px(0.98), "bold"),
-            "chip": (fam, px(0.64), "bold"),
+            "chip": (fam, px(0.70), "bold"),
         })
 
     def _init_style(self):
@@ -673,6 +690,11 @@ class App(tk.Tk):
                                    accent=VIOLET, kind="ghost", height=40,
                                    bg=PANEL, font=FONTS["btn_s"], pad=18)
         self.btn_save.pack(side="right", padx=(10, 0))
+        self.btn_replay = NeonButton(right, "▶  Episode replay",
+                                       self.open_episode_replay, accent=CYAN,
+                                       kind="ghost", height=40, bg=PANEL,
+                                       font=FONTS["btn_s"], pad=18)
+        self.btn_replay.pack(side="right", padx=(10, 0))
         self.btn_stop = NeonButton(right, "■  Stop", self.stop, accent=RED,
                                    kind="ghost", height=40, bg=PANEL,
                                    font=FONTS["btn_s"], pad=18)
@@ -683,14 +705,22 @@ class App(tk.Tk):
         chips = tk.Frame(root, bg=BG)
         chips.pack(fill="x", padx=18, pady=(14, 6))
         self.chip_vals = {}
-        for key, name, col in (("game", "EPISODE", CYAN), ("mse", "MSE", CYAN),
-                               ("loss", "LOSS", AMBER), ("lr", "LR", GREEN),
-                               ("eps", "EPSILON", VIOLET),
-                               ("grad", "‖∇‖ RMS", PINK)):
+        chip_specs = (("game", "EPISODE", CYAN),
+                      ("mse", "MSE AVG", CYAN),
+                      ("loss", "LOSS AVG", AMBER),
+                      ("reward", "REWARD AVG", GREEN),
+                      ("lr", "LR", GREEN), ("eps", "EPSILON", VIOLET),
+                      ("grad", "‖∇‖ RMS (NON-ZERO)", PINK),
+                      ("params", "PARAMETERS", CYAN),
+                      ("zero_grad", "ZERO ∇ (LAST)", RED))
+        for column in range(5):
+            chips.columnconfigure(column, weight=1, uniform="metric")
+        for i, (key, name, col) in enumerate(chip_specs):
             shell = tk.Frame(chips, bg=BORDER)
-            shell.pack(side="left", padx=(0, 10))
+            shell.grid(row=i // 5, column=i % 5, sticky="ew",
+                       padx=(0, 10), pady=(0, 7))
             box = tk.Frame(shell, bg=CARD)
-            box.pack(padx=1, pady=1)
+            box.pack(fill="both", expand=True, padx=1, pady=1)
             tk.Label(box, text=name, bg=CARD, fg=FAINT,
                      font=FONTS["chip"]).pack(anchor="w", padx=14, pady=(8, 0))
             v = tk.StringVar(value="—")
@@ -732,8 +762,8 @@ class App(tk.Tk):
                                 cursor="hand2")
             cb.pack(side="left", padx=(14, 0))
 
-        # moving average of the loss: preset chips + any N typed in
-        tk.Label(self._log_box, text="LOSS AVG", bg=BG, fg=FAINT,
+        # one episode-based moving average shared by MSE, loss and reward
+        tk.Label(self._log_box, text="AVG", bg=BG, fg=FAINT,
                  font=FONTS["chip"]).pack(side="left", padx=(24, 8))
         seg = tk.Frame(self._log_box, bg=_mix(BG, "#ffffff", .05),
                        highlightthickness=1, highlightbackground=BORDER_HI)
@@ -756,11 +786,11 @@ class App(tk.Tk):
         ent.bind("<FocusOut>", self._avg_typed)
         tk.Label(self._log_box, text="episodes", bg=BG, fg=FAINT,
                  font=FONTS["small"]).pack(side="left", padx=(6, 0))
-        Tooltip(ent, "Moving average of the loss, centred: each point is the "
+        Tooltip(ent, "Moving average shared by MSE, loss and reward. Each point is the "
                      "mean of the N episodes around it (at the live edge, of "
-                     "the last N/2 available). The raw per-episode loss stays "
+                     "the last N/2 available). The raw series stay "
                      "in the background, faint. Type any N and press Enter.",
-                title="loss moving average")
+                title="shared moving average")
         self._paint_avg_btns()
 
         # layer selector of the Gradients view: "All" plus one chip per layer,
@@ -784,11 +814,16 @@ class App(tk.Tk):
         holder = tk.Frame(root, bg=BORDER)
         holder.pack(fill="both", expand=True, padx=18, pady=(0, 8))
         self.fig = Figure(figsize=(12, 7), dpi=100, facecolor=BG)
-        self.ax = [self.fig.add_subplot(2, 2, i + 1) for i in range(4)]
-        # the epsilon twin axis is created ONCE: calling twinx() on every redraw
-        # stacks axes on axes and fills the plot with ghost curves and
-        # overlapping tick labels
-        self.ax_eps = self.ax[3].twinx()
+        # Curves: metrics on top; utilities get the wide lower panel.
+        gs = GridSpec(2, 3, figure=self.fig, height_ratios=(1, 1.15),
+                      width_ratios=(1, 1, .72), hspace=.35, wspace=.3)
+        self.ax = [self.fig.add_subplot(gs[0, 0]),
+                   self.fig.add_subplot(gs[0, 1]),
+                   self.fig.add_subplot(gs[0, 2]),
+                   self.fig.add_subplot(gs[1, 0:2]),
+                   self.fig.add_subplot(gs[1, 2])]
+        # The epsilon twin axis is created once, so redraws do not stack ghosts.
+        self.ax_eps = self.ax[4].twinx()
         self.canvas = FigureCanvasTkAgg(self.fig, master=holder)
         tkw = self.canvas.get_tk_widget()
         tkw.configure(bg=BG, highlightthickness=0, bd=0)
@@ -854,6 +889,26 @@ class App(tk.Tk):
             self.update_idletasks()
             self.circuit.refresh(force=True)
         self._redraw()
+
+    def open_episode_replay(self):
+        """Open (or refresh) an animated replay of the latest completed episode."""
+        if not self.last_episode:
+            messagebox.showinfo("Episode replay",
+                                "No completed episode is available yet.")
+            return
+        if self.episode_view is None or not self.episode_view.winfo_exists():
+            meta = getattr(self, "_episode_env", {})
+            self.episode_view = EpisodeView(
+                self, self.last_episode, nx=meta.get("nx", 4),
+                ny=meta.get("ny", 3),
+                obstacle_indexes=meta.get("obstacles", ()),
+                alive_indexes=meta.get("alive", ()),
+                death_indexes=meta.get("death", ()))
+        else:
+            self.episode_view.set_episode(self.last_episode)
+            self.episode_view.deiconify()
+            self.episode_view.lift()
+        self.episode_view.replay()
 
     def _draw_progress(self):
         cv = self.prog
@@ -1126,7 +1181,8 @@ class App(tk.Tk):
                  "structurally zero (layer-1 φ, last-layer ω); an exact 0 in "
                  "one episode usually means no updated action had that gate in "
                  "its light cone. Follows the layer selector; click a row to "
-                 "pin the gate.")
+                 "pin the gate. Exact/structural zero gradients are excluded from "
+                 "every curve, RMS aggregate and heatmap.")
 
     def _build_low_grad_panel(self, parent):
         shell = tk.Frame(parent, bg=BORDER)
@@ -1171,6 +1227,10 @@ class App(tk.Tk):
         self.low_summary = tk.Label(box, text="", bg=CARD, fg=MUTED, anchor="w",
                                     justify="left", font=FONTS["small"])
         self.low_summary.pack(fill="x", padx=14, pady=(6, 6))
+        tk.Label(box, text="ZERO AND STRUCTURAL GRADIENTS ARE EXCLUDED FROM "
+                           "CURVES, RMS AND HEATMAP", bg=CARD, fg=AMBER,
+                 justify="left", wraplength=360,
+                 font=FONTS["chip"]).pack(fill="x", padx=14, pady=(0, 8))
 
         st = ttk.Style(self)
         rowh = max(22, int(self.tk.call("font", "metrics", FONTS["mono"],
@@ -1370,7 +1430,7 @@ class App(tk.Tk):
         G[:, dead_mask(L)] = np.nan
         # an exact zero means "no signal this episode" (light cone), not a
         # vanishing gradient: leave it out as well
-        G[G < GRAD_ZERO] = np.nan
+        G[np.abs(G) < GRAD_ZERO] = np.nan
 
         if layer == "current":
             layer = self.grad_layer
@@ -1514,7 +1574,7 @@ class App(tk.Tk):
         if interactive:
             self.canvas_grad.draw_idle()
 
-    # -- loss moving average ---------------------------------------------------
+    # -- shared episode-based moving average -----------------------------------
     _AVG_PRESETS = (1, 10, 20, 50, 100, 500)
 
     def _paint_avg_btns(self):
@@ -1542,29 +1602,38 @@ class App(tk.Tk):
             self.avg_var.set(str(self.loss_avg_n))
 
     @staticmethod
-    def _moving_avg(values, n: int) -> np.ndarray:
-        """Centred moving average over ``n`` points, shrinking at the edges.
-
-        Centred rather than trailing so the curve runs through the middle of
-        the raw cloud instead of lagging behind it; near the ends only the
-        points that exist are averaged (at the live edge that means the last
-        ~n/2 episodes).
-        """
+    def _moving_avg(games, values, n: int) -> np.ndarray:
+        """Centred average in an episode-width window (also for sparse MSE)."""
+        x = np.asarray(games, dtype=float)
         v = np.asarray(values, dtype=float)
         if n <= 1 or len(v) == 0:
             return v
-        c = np.concatenate([[0.0], np.cumsum(v)])
-        i = np.arange(len(v))
-        lo = np.clip(i - n // 2, 0, len(v))
-        hi = np.clip(i - n // 2 + n, 0, len(v))
-        return (c[hi] - c[lo]) / (hi - lo)
+        half = n / 2.0
+        cumulative = np.concatenate([[0.0], np.cumsum(v)])
+        lo = np.searchsorted(x, x - half, side="left")
+        hi = np.searchsorted(x, x + half, side="right")
+        return (cumulative[hi] - cumulative[lo]) / np.maximum(hi - lo, 1)
+
+    def _window_mean(self, games, values):
+        if not values:
+            return None
+        if self.loss_avg_n <= 1:
+            return float(values[-1])
+        last = games[-1]
+        selected = [v for g, v in zip(games, values)
+                    if g >= last - self.loss_avg_n + 1]
+        return float(np.mean(selected)) if selected else None
+
+    def _update_metric_chips(self):
+        for key, data, value_key in (("mse", self.history, "mse"),
+                                     ("loss", self.loss_ep, "loss"),
+                                     ("reward", self.reward_ep, "reward")):
+            value = self._window_mean(data["game"], data[value_key])
+            if value is not None:
+                self.chip_vals[key].set("%.4f" % value)
 
     def _update_loss_chip(self):
-        """The LOSS chip shows the mean of the last N episodes (N = the window)."""
-        lv = self.loss_ep["loss"]
-        if lv:
-            self.chip_vals["loss"].set(
-                "%.4f" % float(np.mean(lv[-max(1, self.loss_avg_n):])))
+        self._update_metric_chips()
 
     def _redraw_curves(self):
         self._curves_drawn = time.time()
@@ -1575,11 +1644,21 @@ class App(tk.Tk):
             a.clear()
 
         a = self.ax[0]
-        a.plot(h["game"], h["mse"], color=CYAN, lw=1.7)
-        if h["mse"]:
-            a.plot(h["game"][-1:], h["mse"][-1:], "o", color=CYAN, ms=5)
-        self._style_axes(a, "MSE against Bellman", "episodes")
-        self._apply_yscale(a, h["mse"], self.log_mse.get())
+        mg, mv = h["game"], h["mse"]
+        n = self.loss_avg_n
+        if n > 1:
+            a.plot(mg, mv, color=CYAN, lw=0.8, alpha=0.22, label="evaluations")
+            ma = self._moving_avg(mg, mv, n)
+            a.plot(mg, ma, color=CYAN, lw=2.0, label="mean over %d episodes" % n)
+            title = "MSE against Bellman · moving average over %d episodes" % n
+        else:
+            ma = np.asarray(mv)
+            a.plot(mg, mv, color=CYAN, lw=1.2)
+            title = "MSE against Bellman · no averaging"
+        if len(mg):
+            a.plot(mg[-1:], ma[-1:], "o", color=CYAN, ms=5)
+        self._style_axes(a, title, "episodes")
+        self._apply_yscale(a, mv, self.log_mse.get())
 
         # loss: every episode, raw and faint, with the moving average on top
         a = self.ax[1]
@@ -1587,7 +1666,7 @@ class App(tk.Tk):
         n = self.loss_avg_n
         if n > 1:
             a.plot(g, lv, color=AMBER, lw=0.8, alpha=0.22, label="per episode")
-            avg = self._moving_avg(lv, n)
+            avg = self._moving_avg(g, lv, n)
             a.plot(g, avg, color=AMBER, lw=2.0, label="mean of %d episodes" % n)
             if len(g):
                 a.plot(g[-1:], avg[-1:], "o", color=AMBER, ms=5)
@@ -1604,6 +1683,24 @@ class App(tk.Tk):
         self._apply_yscale(a, lv, self.log_loss.get())
 
         a = self.ax[2]
+        rg, rv = self.reward_ep["game"], self.reward_ep["reward"]
+        if n > 1:
+            a.plot(rg, rv, color=GREEN, lw=0.8, alpha=0.22,
+                   label="discounted reward per episode")
+            ra = self._moving_avg(rg, rv, n)
+            a.plot(rg, ra, color=GREEN, lw=2.0,
+                   label="mean over %d episodes" % n)
+            title = "discounted reward · moving average over %d episodes" % n
+        else:
+            ra = np.asarray(rv)
+            a.plot(rg, rv, color=GREEN, lw=1.2)
+            title = "discounted reward · per episode (no averaging)"
+        if len(rg):
+            a.plot(rg[-1:], ra[-1:], "o", color=GREEN, ms=5)
+        self._style_axes(a, title, "episodes")
+
+        # Utilities: exact Bellman values versus the learned VQC, state by state.
+        a = self.ax[3]
         if self.U is not None and self.correct:
             idx = self.correct
             a.plot(idx, [self.U_ref[i] for i in idx], marker="o", ls="--",
@@ -1615,7 +1712,7 @@ class App(tk.Tk):
             leg.get_frame().set_linewidth(0.8)
         self._style_axes(a, "utilities  max$_a$ Q(s,a)", "state")
 
-        a = self.ax[3]
+        a = self.ax[4]
         a.plot(h["game"], h["lr"], color=GREEN, lw=1.7)
         self._style_axes(a, "learning rate and epsilon", "episodes")
         a.set_ylabel("learning rate", color=GREEN, fontsize=10)
@@ -1634,7 +1731,8 @@ class App(tk.Tk):
         for sp in t.spines.values():
             sp.set_visible(False)
 
-        self.fig.tight_layout(pad=2.0)
+        self.fig.subplots_adjust(left=.065, right=.93, bottom=.08, top=.94,
+                                 hspace=.38, wspace=.35)
         self.canvas.draw_idle()
 
     # ------------------------------------------------------------ screens ---
@@ -1681,6 +1779,58 @@ class App(tk.Tk):
 
         return replace(Config(fixes=self._fixes()), **kw)
 
+    def _extra_setup_state(self):
+        """Subclass hook for setup controls not stored in ``self.vars``."""
+        return {}
+
+    def _apply_extra_setup_state(self, _data):
+        """Inverse subclass hook used while restoring the last setup."""
+
+    def _setup_snapshot(self):
+        return {
+            "version": 1,
+            "parameters": {name: var.get() for name, (var, _kind) in self.vars.items()},
+            "output": self.out_var.get(),
+            "preferences": {
+                "average_episodes": self.loss_avg_n,
+                "log_mse": bool(self.log_mse.get()),
+                "log_loss": bool(self.log_loss.get()),
+            },
+            **self._extra_setup_state(),
+        }
+
+    def _save_last_setup(self):
+        """Persist a validated Start configuration atomically."""
+        try:
+            write_json(LAST_SETUP_PATH, self._setup_snapshot())
+        except (OSError, TypeError, ValueError):
+            pass  # preferences must never prevent a training run
+
+    def _load_last_setup(self):
+        """Restore the previous Start configuration; ignore absent/bad JSON."""
+        try:
+            with open(LAST_SETUP_PATH, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                return
+            for name, value in data.get("parameters", {}).items():
+                if name in self.vars:
+                    self.vars[name][0].set("" if value is None else str(value))
+            if isinstance(data.get("output"), str) and data["output"].strip():
+                self.out_var.set(data["output"].strip())
+            prefs = data.get("preferences", {})
+            if isinstance(prefs, dict):
+                self.log_mse.set(bool(prefs.get("log_mse", self.log_mse.get())))
+                self.log_loss.set(bool(prefs.get("log_loss", self.log_loss.get())))
+                try:
+                    self.set_loss_avg(int(prefs.get("average_episodes",
+                                                    self.loss_avg_n)))
+                except (TypeError, ValueError):
+                    pass
+            self._apply_extra_setup_state(data)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
     def _fixes(self) -> FixFlags:
         """Always the corrected agent.  Only the debug GUI overrides this."""
         return FixFlags()
@@ -1718,9 +1868,11 @@ class App(tk.Tk):
         if out_dir is None:
             return
         self.out_dir = out_dir
+        self._save_last_setup()
 
         self.history = {k: [] for k in self.history}
         self.loss_ep = {"game": [], "loss": []}
+        self.reward_ep = {"game": [], "reward": []}
         self.params.clear()
         self.circuit.reset(q_scale=cfg.q_scale)
         self._build_layer_chips(cfg.deep_layers)
@@ -1729,6 +1881,8 @@ class App(tk.Tk):
         self._progress = 0.0
         for v in self.chip_vals.values():
             v.set("—")
+        self.chip_vals["params"].set(str(cfg.deep_layers * 4 * 3))
+        self.chip_vals["zero_grad"].set("—")
         self.stop_flag.clear()
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -1768,6 +1922,11 @@ class App(tk.Tk):
                 "correct": correct_indexes(env),
                 "U_ref": np.asarray(U_ref, dtype=float),
                 "policy_ref": np.asarray(pol_ref, dtype=int),
+                "episode_env": {
+                    "nx": env.Nx, "ny": env.Ny,
+                    "obstacles": env.obstacle_indexes,
+                    "alive": env.alive_indexes, "death": env.death_indexes,
+                },
             }))
 
             summary = base_summary(cfg, env, bellman, pol_ref)
@@ -1775,16 +1934,19 @@ class App(tk.Tk):
             write_bellman_plots(out_dir, env, bellman, pol_ref)
             live = LivePlotter(os.path.join(out_dir, "live.png"),
                                correct_indexes(env))
-            last = {"info": None, "io": 0.0}
+            last = {"info": None, "episode": None, "io": 0.0}
 
             def write_progress():
                 """live.png + progress.json.  Both cost more the longer the run
                 (a pyplot redraw, the whole history rewritten), so they are
                 written at most every IO_EVERY seconds, and once at the end."""
                 info = last["info"]
+                episode = last["episode"]
+                last["io"] = time.time()
+                if episode is not None:
+                    write_json(os.path.join(out_dir, "last_episode.json"), episode)
                 if info is None:
                     return
-                last["io"] = time.time()
                 live.draw()
                 write_json(os.path.join(out_dir, "progress.json"), {
                     **history,
@@ -1792,6 +1954,7 @@ class App(tk.Tk):
                     "policy": jsonable(info.get("policy")),
                     "weights": jsonable(p_W[-1] if p_W else None),
                     "grad_rms": jsonable(p_G[-1] if p_G else None),
+                    "last_episode": episode,
                 })
 
             def monitor(info):
@@ -1812,6 +1975,13 @@ class App(tk.Tk):
                 p_games.append(info["game"])
                 p_W.append(info["weights"])
                 p_G.append(info["grad_rms"])
+                if info["game"] >= 0 and info.get("trajectory"):
+                    episode = {key: jsonable(info.get(key)) for key in
+                               ("game", "discounted_reward", "trajectory",
+                                "actions", "rewards", "steps")}
+                    last["episode"] = episode
+                if time.time() - last["io"] >= self.IO_EVERY:
+                    write_progress()
                 self.queue.put(("game", info))
 
             t0 = time.time()
@@ -1823,6 +1993,7 @@ class App(tk.Tk):
             summary["training"] = training_summary(res, bellman, env, elapsed)
             summary["training"]["stopped"] = False
             summary["training"]["weights_final"] = jsonable(p_W[-1])
+            summary["training"]["last_episode"] = last["episode"]
             self._write_params(out_dir, p_games, p_W, p_G)
             write_training_plots(out_dir, env, bellman, res)
             write_json(os.path.join(out_dir, "summary.json"), summary)
@@ -1842,7 +2013,8 @@ class App(tk.Tk):
                                        "seconds": time.time() - t0,
                                        "history": history,
                                        "weights_final": jsonable(
-                                           p_W[-1] if p_W else None)}
+                                           p_W[-1] if p_W else None),
+                                       "last_episode": last["episode"]}
                 try:
                     write_json(os.path.join(out_dir, "summary.json"), summary)
                     self._write_params(out_dir, p_games, p_W, p_G)
@@ -2013,18 +2185,41 @@ class App(tk.Tk):
                     continue
 
                 if kind == "game":
-                    self.params.append(payload["game"], payload["weights"],
+                    game = payload["game"]
+                    self.params.append(game, payload["weights"],
                                        payload["grad_rms"])
                     g = payload["grad_rms"]
                     if g is not None:
-                        self.chip_vals["grad"].set(
-                            "%.1e" % float(np.sqrt(np.mean(g ** 2))))
+                        zero = np.abs(g) < GRAD_ZERO
+                        structural = dead_mask(g.shape[0])
+                        valid = ~(zero | structural)
+                        rms = (float(np.sqrt(np.mean(np.asarray(g)[valid] ** 2)))
+                               if np.any(valid) else float("nan"))
+                        self.chip_vals["grad"].set("%.1e" % rms)
+                        self.chip_vals["params"].set(str(g.size))
+                        self.chip_vals["zero_grad"].set(str(int(np.sum(zero))))
                     self._last_game_at = time.time()
+                    if game >= 0:
+                        self.chip_vals["game"].set("%d / %d" %
+                                                   (game, self.total_games))
+                    if game >= 0 and payload.get("trajectory"):
+                        self.last_episode = {
+                            key: jsonable(payload.get(key)) for key in
+                            ("game", "discounted_reward", "trajectory",
+                             "actions", "rewards", "steps")}
+                        if (self.episode_view is not None and
+                                self.episode_view.winfo_exists()):
+                            self.episode_view.set_episode(self.last_episode)
+                            self.episode_view.replay()
                     if payload.get("loss") is not None:
-                        self.loss_ep["game"].append(payload["game"])
+                        self.loss_ep["game"].append(game)
                         self.loss_ep["loss"].append(payload["loss"])
-                        self._update_loss_chip()
-                        self._loss_new = True
+                    if payload.get("discounted_reward") is not None and game >= 0:
+                        self.reward_ep["game"].append(game)
+                        self.reward_ep["reward"].append(
+                            payload["discounted_reward"])
+                    self._update_metric_chips()
+                    self._loss_new = True
                     self.circuit.mark_dirty()
                     continue
 
@@ -2033,6 +2228,7 @@ class App(tk.Tk):
                     self.policy_ref = payload["policy_ref"]
                     self.policy = None
                     self.U_ref = payload["U_ref"]
+                    self._episode_env = payload["episode_env"]
                     self.circuit.set_reference(self.policy_ref, self.U_ref)
                     self.status.set("training in progress...")
 
@@ -2051,7 +2247,7 @@ class App(tk.Tk):
                         self.policy = payload["policy"]
                     self.chip_vals["game"].set("%d / %d" % (payload["game"],
                                                             self.total_games))
-                    self.chip_vals["mse"].set("%.4f" % payload["mse"])
+                    self._update_metric_chips()
                     self.chip_vals["lr"].set("%.5f" % payload["lr"])
                     self.chip_vals["eps"].set("%.3f" % payload["epsilon"])
                     self._progress = payload["game"] / float(self.total_games)
