@@ -1640,13 +1640,18 @@ class App(tk.Tk):
                          "layer %d · per qubit" % (lay + 1), "episodes")
         a.set_yscale("log")
 
-        # 3. heatmap: every parameter, or the 12 of the focused layer
+        # 3. heatmap: every parameter, or the 12 of the focused layer.
+        # Keep titles compact and explicitly two-line so the neighbouring
+        # bottom-right panel can never be invaded by a long title.
         a = axes[2]
-        self._style_axes(a, "every parameter  (log₁₀ gradient RMS · grey = no "
-                            "effect / no signal)" if lay is None else
-                         "layer %d  (log₁₀ gradient RMS%s)" % (
-                             lay + 1, " · click a row to pin its gate" if hints
-                             else ""), "episodes")
+        if lay is None:
+            heat_title = "every parameter · log₁₀ gradient RMS\n" \
+                         "grey = excluded / no signal"
+        else:
+            heat_title = "layer %d · log₁₀ gradient RMS" % (lay + 1)
+            if hints:
+                heat_title += "\nclick a row to pin its gate"
+        self._style_axes(a, heat_title, "episodes")
         a.grid(False)
         if n:
             block = G if lay is None else G[:, lay:lay + 1]
@@ -1689,10 +1694,12 @@ class App(tk.Tk):
             title = "layer %d · q%d  —  φ θ ω" % (l + 1, i)
             series = [G[:, l, i, j] for j in range(3)]
         else:
-            where = "the whole circuit" if lay is None else "layer %d" % (lay + 1)
-            title = "φ / θ / ω averaged over %s" % where
+            if lay is None:
+                title = "φ / θ / ω · whole-circuit average"
+            else:
+                title = "φ / θ / ω · layer %d average" % (lay + 1)
             if hints:
-                title += "  (pin a gate to follow it)"
+                title += "\npin a gate to follow it"
             src = G if lay is None else G[:, lay:lay + 1]
             series = [rms(src[:, :, :, j]) if n else [] for j in range(3)]
         for j, ser in enumerate(series):
@@ -1713,7 +1720,7 @@ class App(tk.Tk):
             axes[0].text(0.5, 0.5, "gradients appear after the first "
                                  "episode", transform=axes[0].transAxes,
                                  ha="center", color=FAINT)
-        fig.tight_layout(pad=2.0)
+        fig.tight_layout(pad=2.0, h_pad=2.4, w_pad=2.4)
         if interactive:
             self.canvas_grad.draw_idle()
 

@@ -952,9 +952,28 @@ class CircuitView(tk.Frame):
         lo, hi = float(np.min(allv)), float(np.max(allv))
         if hi - lo < 1e-12:
             lo, hi = lo - 0.5, hi + 0.5
-        pt, pb = y0 + 20, y1 - 6
+        if log:
+            fmt = lambda v: "1e%.1f" % v
+        else:
+            fmt = lambda v: "%+.2f" % v
+
+        # Reserve independent vertical and right-hand gutters.  The title and
+        # scale labels must never consume pixels from the plotted data region.
+        try:
+            title_h = int(cv.tk.call("font", "metrics", FONTS["chip"],
+                                     "-linespace"))
+            scale_w = max(
+                int(cv.tk.call("font", "measure", FONTS["chip"], fmt(lo))),
+                int(cv.tk.call("font", "measure", FONTS["chip"], fmt(hi))),
+            ) + 10
+        except (tk.TclError, TypeError, ValueError):
+            title_h, scale_w = 18, 46
+        scale_w = max(46, scale_w)
+        pt, pb = y0 + max(32, title_h + 14), y1 - 7
+        pl, pr = x0 + 5, max(x0 + 20, x1 - scale_w)
         span = max(1, n - 1)
-        k = max(1, n // int(max(x1 - x0, 50)))
+        plot_w = max(1, pr - pl)
+        k = max(1, n // int(max(plot_w, 50)))
         idx = np.arange(0, n, k)
         if idx[-1] != n - 1:
             idx = np.append(idx, n - 1)
@@ -964,21 +983,17 @@ class CircuitView(tk.Frame):
                 v = a[t]
                 if not np.isfinite(v):
                     continue
-                pts += [x0 + 4 + (x1 - x0 - 8) * t / span,
+                pts += [pl + plot_w * t / span,
                         pb - (pb - pt) * (v - lo) / (hi - lo)]
             if len(pts) >= 4:
                 cv.create_line(*pts, fill=color, width=1.6)
-        if log:
-            fmt = lambda v: "1e%.1f" % v
-        else:
-            fmt = lambda v: "%+.2f" % v
-        cv.create_text(x1 - 4, pt - 2, anchor="ne", text=fmt(hi), fill=FAINT,
+        cv.create_text(x1 - 5, pt, anchor="ne", text=fmt(hi), fill=FAINT,
                        font=FONTS["chip"])
-        cv.create_text(x1 - 4, pb, anchor="se", text=fmt(lo), fill=FAINT,
+        cv.create_text(x1 - 5, pb, anchor="se", text=fmt(lo), fill=FAINT,
                        font=FONTS["chip"])
         if cur >= 0:
-            xc = x0 + 4 + (x1 - x0 - 8) * cur / span
-            cv.create_line(xc, pt - 4, xc, pb, fill=TEXT, dash=(2, 3))
+            xc = pl + plot_w * cur / span
+            cv.create_line(xc, pt, xc, pb, fill=TEXT, dash=(2, 3))
 
     # -- mouse -------------------------------------------------------------
     def _item_tag(self, e):
