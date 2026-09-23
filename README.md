@@ -5,18 +5,6 @@ action-value function in deep Q-learning on a stochastic 4×3 grid world. Exact
 Bellman value iteration provides a reference for learned values and policies.
 It is part of an internship done in 2024 in Porto, under the supervision of Prof. Duarte Magano and Ariel Guerreiro.
 
-## Method
-
-For encoded state \(E(s)\), one circuit expectation estimates each action value:
-\[
-Q_\theta(s,a)=\kappa\langle Z_a\rangle_{U_\theta E(s)|0\rangle}.
-\]
-Replay training minimizes the squared temporal-difference error, with a target
-network:
-\[
-y=r+\gamma(1-d)\max_{a'}Q_{\theta^-}(s',a'),\qquad
-\mathcal L=\tfrac12(Q_\theta(s,a)-y)^2.
-\]
 
 ## Live visualization
 
