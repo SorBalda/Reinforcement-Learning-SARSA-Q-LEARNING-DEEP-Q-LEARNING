@@ -19,14 +19,14 @@ y=r+\gamma(1-d)\max_{a'}Q_{\theta^-}(s',a'),\qquad
 
 ## Live visualization
 
-![VQC circuit and parameter gradients](docs/assets/vqc-circuit-gradients.png)
+![Circuit, gradients, and policy updating live](docs/assets/live-training-tabs.gif)
 
 ![Training metrics updating in real time](docs/assets/training-metrics.gif)
 
-The circuit view exposes parameter gradients; the animation replays a real
-10,000-episode run with MSE, TD loss, discounted reward, learning rate, and
-epsilon updating over time. Structurally zero gradients are identified and
-excluded from aggregate gradient statistics.
+The first animation replays real checkpoints while the GUI rotates through
+Circuit, Gradients, and Policy. The second follows MSE, TD loss, discounted
+reward, learning rate, and epsilon during the same 10,000-episode run.
+Structurally zero gradients are excluded from aggregate statistics.
 
 ## Quick start
 
