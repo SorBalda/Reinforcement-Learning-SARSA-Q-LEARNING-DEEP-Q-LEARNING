@@ -17,15 +17,16 @@ y=r+\gamma(1-d)\max_{a'}Q_{\theta^-}(s',a'),\qquad
 \mathcal L=\tfrac12(Q_\theta(s,a)-y)^2.
 \]
 
-## Gradient visualizations
+## Live visualization
 
 ![VQC circuit and parameter gradients](vqc-rl/docs/assets/vqc-circuit-gradients.png)
 
-![Gradient landscape across training](vqc-rl/docs/assets/vqc-gradient-landscape.png)
+![Training metrics updating in real time](vqc-rl/docs/assets/training-metrics.gif)
 
-The circuit view shows gradient magnitudes for its trainable angles; the
-landscape tracks their signal across episodes. The first-layer `φ` and
-last-layer `ω` angles are structurally unobservable, so their gradients vanish.
+The circuit view exposes parameter gradients; the animation replays a real
+10,000-episode run with MSE, TD loss, discounted reward, learning rate, and
+epsilon updating over time. Structurally zero gradients are identified and
+excluded from aggregate gradient statistics.
 
 ## Quick start
 
