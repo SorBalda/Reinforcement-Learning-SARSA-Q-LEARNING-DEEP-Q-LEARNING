@@ -3,7 +3,7 @@
 This project studies a four-qubit variational quantum circuit (VQC) as the
 action-value function in deep Q-learning on a stochastic 4×3 grid world. Exact
 Bellman value iteration provides a reference for learned values and policies.
-It is part of an internship done in 2024 in Porto, under the supervision of Prof. Duarte Magano and Ariel Guerreiro.
+It is part of an internship done in 2024 in Porto University, under the supervision of Prof. Duarte Magano and Ariel Guerreiro.
 
 
 ## Live visualization
