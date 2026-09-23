@@ -38,6 +38,5 @@ parameter history, and gradient statistics.
 
 ## Reproducibility and original implementation
 
-Notebook-compatibility mode is verified bit-for-bit against the original implementation. The
-corrected default fixes its TD-state swap: the prediction must use `Q(s,a)`, not
-`Q(s′,a)`. The original notebooks are retained in [original/](original/) for historical attribution to the original internship implementation.
+Notebook-compatibility mode is verified bit-for-bit against the original implementation. The original code had a bug: only for the VQC implementation used `Q(s_f,a)` instead of 
+`Q(s_i,a)` in the predicted value in the training loop (the classical training loop was not affected by this bug). In this GUI, this bug is fixed.  The original notebooks are retained in [original/](original/). for historical attribution to the original internship implementation.
