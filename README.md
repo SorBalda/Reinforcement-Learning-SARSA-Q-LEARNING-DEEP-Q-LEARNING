@@ -1,4 +1,4 @@
-# Visualizing a VQC in Reinforcement Learning
+# Visualizing a VQC in Reinforcement Learning (frozen lake environment)
 
 This project studies a four-qubit variational quantum circuit (VQC) as the
 action-value function in deep Q-learning on a stochastic 4×3 grid world. Exact
