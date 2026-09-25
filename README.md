@@ -1,7 +1,9 @@
 # Visualizing a VQC in Reinforcement Learning (frozen lake environment)
 
-This project studies a four-qubit variational quantum circuit (VQC) as the
-action-value function in deep Q-learning on a stochastic 4×3 grid world. Exact
+This project studies variational quantum circuits (VQC) as the
+action-value function in deep Q-learning on a stochastic 4×3 grid world. 
+You can run the gui, setup easily and run the simulation. Look at live performance and live parameters across your circuit.
+Exact
 Bellman value iteration provides a reference for learned values and policies.
 It is part of an internship done in 2024 in Porto University, under the supervision of Prof. Duarte Magano and Ariel Guerreiro.
 
